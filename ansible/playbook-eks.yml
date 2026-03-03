@@ -1,0 +1,53 @@
+---
+# =============================================================================
+# ansible/playbook-eks.yml
+# =============================================================================
+# PLAYBOOK 1 — Provision EKS infrastructure using Terraform.
+#
+# Called by Workflow 1 (.github/workflows/1-provision-eks.yml).
+# Loads the correct environment vars file then runs the provision_eks role
+# which orchestrates Terraform to build the entire AWS stack.
+#
+# USAGE — plan only (no changes applied, safe to run at any time):
+#   ansible-playbook playbook-eks.yml -e "target_env=dev"
+#   ansible-playbook playbook-eks.yml -e "target_env=staging"
+#   ansible-playbook playbook-eks.yml -e "target_env=prod"
+#
+# USAGE — plan and apply:
+#   ansible-playbook playbook-eks.yml -e "target_env=dev     terraform_apply=true"
+#   ansible-playbook playbook-eks.yml -e "target_env=staging terraform_apply=true"
+#   ansible-playbook playbook-eks.yml -e "target_env=prod    terraform_apply=true"
+#
+# The when: condition on each play ensures only the targeted environment runs.
+# The others are skipped, not failed.
+# =============================================================================
+
+- name: "Provision EKS — DEV"
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  when: target_env | default('') == 'dev'
+  vars_files:
+    - "environments/dev/vars.yml"
+  roles:
+    - role: provision_eks
+
+- name: "Provision EKS — STAGING"
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  when: target_env | default('') == 'staging'
+  vars_files:
+    - "environments/staging/vars.yml"
+  roles:
+    - role: provision_eks
+
+- name: "Provision EKS — PROD"
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  when: target_env | default('') == 'prod'
+  vars_files:
+    - "environments/prod/vars.yml"
+  roles:
+    - role: provision_eks

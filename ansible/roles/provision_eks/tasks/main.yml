@@ -1,0 +1,259 @@
+---
+# =============================================================================
+# ansible/roles/provision_eks/tasks/main.yml
+# =============================================================================
+# Orchestrates Terraform to provision the EKS cluster and supporting AWS
+# infrastructure. Runs entirely on the GitHub-hosted runner (ubuntu-latest).
+# AWS credentials are already in the environment from the OIDC step in the
+# workflow before Ansible is called.
+#
+# TASK EXECUTION ORDER
+#  1.  Validate all required variables are present
+#  2.  Print the AWS identity being used (for audit logs)
+#  3.  Set working paths for Terraform
+#  4.  Render terraform.tfvars from the Jinja2 template
+#  5.  terraform init  (download providers, configure S3 backend)
+#  6.  terraform validate  (syntax check, no API calls)
+#  7.  terraform plan  (calculate what will change, save plan file)
+#  8.  Prod safety gate  (prompts for confirmation on local non-CI runs)
+#  9.  terraform apply  (create/update infrastructure - only if apply=true)
+#  10. Capture and display Terraform outputs
+#  11. Remove plan file from disk
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# TASK 1: Validate required variables
+# Fail immediately with a clear message rather than letting Terraform fail
+# several minutes in with a cryptic provider error.
+# -----------------------------------------------------------------------------
+- name: Validate required variables are defined
+  ansible.builtin.assert:
+    that:
+      - environment         is defined
+      - environment         in ['dev', 'staging', 'prod']
+      - aws_region          is defined
+      - cluster_name        is defined
+      - k8s_version         is defined
+      - node_instance_type  is defined
+      - node_count_min      is defined
+      - node_count_desired  is defined
+      - node_count_max      is defined
+      - vpc_cidr            is defined
+      - public_subnet_cidrs is defined
+      - private_subnet_cidrs is defined
+      - availability_zones  is defined
+      - tf_state_bucket     is defined
+      - tf_state_key        is defined
+      - tf_lock_table       is defined
+    fail_msg: >
+      One or more required variables are missing.
+      Check ansible/environments/{{ environment | default('?') }}/vars.yml
+
+# -----------------------------------------------------------------------------
+# TASK 2: Print AWS identity
+# Shows the IAM role ARN and account ID in the job log so you can verify
+# which credentials are being used. Useful for debugging and auditing.
+# -----------------------------------------------------------------------------
+- name: Get AWS caller identity
+  ansible.builtin.command: aws sts get-caller-identity
+  register: aws_identity
+  changed_when: false
+  environment:
+    AWS_DEFAULT_REGION: "{{ aws_region }}"
+
+- name: Show AWS identity in use
+  ansible.builtin.debug:
+    msg: "Running as: {{ (aws_identity.stdout | from_json).Arn }}"
+
+# -----------------------------------------------------------------------------
+# TASK 3: Set Terraform working paths
+# All Terraform commands run inside terraform/environments/<env>/.
+# Each environment directory has its own main.tf, variables.tf, and outputs.tf.
+# The terraform.tfvars file is generated dynamically by Task 4.
+# -----------------------------------------------------------------------------
+- name: Set Terraform directory paths
+  ansible.builtin.set_fact:
+    tf_dir:      "{{ playbook_dir }}/../terraform/environments/{{ environment }}"
+    tfvars_file: "{{ playbook_dir }}/../terraform/environments/{{ environment }}/terraform.tfvars"
+    tfplan_file: "{{ playbook_dir }}/../terraform/environments/{{ environment }}/tfplan.out"
+
+# -----------------------------------------------------------------------------
+# TASK 4: Render terraform.tfvars
+# Ansible renders the Jinja2 template (eks-tfvars.j2) using the variables
+# loaded from environments/<env>/vars.yml. This produces the terraform.tfvars
+# file that Terraform reads during plan and apply.
+# The file is always regenerated — never edit it manually.
+# -----------------------------------------------------------------------------
+- name: Render terraform.tfvars from Jinja2 template
+  ansible.builtin.template:
+    src:    eks-tfvars.j2
+    dest:   "{{ tfvars_file }}"
+    mode:   "0640"
+    backup: true
+  register: tfvars_result
+
+- name: Show tfvars status
+  ansible.builtin.debug:
+    msg: "terraform.tfvars written to {{ tfvars_file }} (changed={{ tfvars_result.changed }})"
+
+# -----------------------------------------------------------------------------
+# TASK 5: terraform init
+# Downloads the required Terraform providers (hashicorp/aws ~> 5.0) and
+# configures the S3 remote backend so state is stored centrally and shared
+# across all pipeline runs. The backend config is passed via -backend-config
+# flags rather than hardcoded in the HCL, so the same Terraform code works
+# for all three environments with different state keys.
+# -reconfigure forces re-initialisation if the backend config changes.
+# -----------------------------------------------------------------------------
+- name: Terraform init
+  ansible.builtin.command:
+    cmd: >
+      terraform init -reconfigure
+      -backend-config="bucket={{ tf_state_bucket }}"
+      -backend-config="key={{ tf_state_key }}"
+      -backend-config="region={{ aws_region }}"
+      -backend-config="encrypt=true"
+      -backend-config="dynamodb_table={{ tf_lock_table }}"
+    chdir: "{{ tf_dir }}"
+  register: tf_init
+  changed_when: false
+  environment:
+    AWS_DEFAULT_REGION: "{{ aws_region }}"
+
+- name: Show init output
+  ansible.builtin.debug:
+    var: tf_init.stdout_lines
+  when: tf_verbose | default(false) | bool
+
+# -----------------------------------------------------------------------------
+# TASK 6: terraform validate
+# Checks HCL syntax without making any AWS API calls.
+# Catches typos and structural errors before wasting time on a plan.
+# -----------------------------------------------------------------------------
+- name: Terraform validate
+  ansible.builtin.command:
+    cmd:   terraform validate
+    chdir: "{{ tf_dir }}"
+  changed_when: false
+  environment:
+    AWS_DEFAULT_REGION: "{{ aws_region }}"
+
+# -----------------------------------------------------------------------------
+# TASK 7: terraform plan
+# Compares the desired state (vars.yml -> terraform.tfvars) against the
+# real AWS state stored in S3. Generates a precise list of changes.
+# The plan is saved to a file so apply uses exactly what was reviewed.
+#
+# Exit codes:
+#   0 = no changes needed
+#   2 = changes are present (this is not an error)
+#   1 = error
+# -----------------------------------------------------------------------------
+- name: Terraform plan
+  ansible.builtin.command:
+    cmd: >
+      terraform plan
+      -var-file="{{ tfvars_file }}"
+      -out="{{ tfplan_file }}"
+      -detailed-exitcode
+    chdir: "{{ tf_dir }}"
+  register: tf_plan
+  changed_when:  tf_plan.rc == 2
+  failed_when:   tf_plan.rc not in [0, 2]
+  environment:
+    AWS_DEFAULT_REGION: "{{ aws_region }}"
+
+- name: Show plan output
+  ansible.builtin.debug:
+    var: tf_plan.stdout_lines
+
+- name: Report no changes needed
+  ansible.builtin.debug:
+    msg: "No infrastructure changes required for {{ environment }}."
+  when: tf_plan.rc == 0
+
+# -----------------------------------------------------------------------------
+# TASK 8: Prod safety gate (local / non-CI runs only)
+# The CI environment variable is set to 'true' by GitHub Actions automatically.
+# This gate is only active when running locally, protecting against accidental
+# applies to production from a developer's machine.
+# In the pipeline this task is always skipped.
+# -----------------------------------------------------------------------------
+- name: Prompt for prod confirmation (local runs only)
+  ansible.builtin.pause:
+    prompt: |
+      WARNING: You are about to apply changes to the PRODUCTION EKS cluster.
+      Type 'yes' to continue or press Ctrl+C to abort
+  register: prod_confirm
+  when:
+    - environment == 'prod'
+    - tf_plan.rc == 2
+    - terraform_apply | default(false) | bool
+    - not (lookup('env', 'CI') | bool)
+
+- name: Abort if prod confirmation not given
+  ansible.builtin.fail:
+    msg: "Production apply aborted — confirmation not provided."
+  when:
+    - environment == 'prod'
+    - tf_plan.rc == 2
+    - terraform_apply | default(false) | bool
+    - not (lookup('env', 'CI') | bool)
+    - prod_confirm.user_input | default('') != 'yes'
+
+# -----------------------------------------------------------------------------
+# TASK 9: terraform apply
+# Applies the saved plan file. Using the saved plan file (rather than
+# re-planning) guarantees that exactly what was reviewed gets applied.
+# Skipped entirely if:
+#   - terraform_apply is false (plan-only run)
+#   - tf_plan.rc == 0 (no changes needed)
+# -----------------------------------------------------------------------------
+- name: Terraform apply
+  ansible.builtin.command:
+    cmd:   "terraform apply -auto-approve {{ tfplan_file }}"
+    chdir: "{{ tf_dir }}"
+  register: tf_apply
+  when:
+    - tf_plan.rc == 2
+    - terraform_apply | default(false) | bool
+  environment:
+    AWS_DEFAULT_REGION: "{{ aws_region }}"
+
+- name: Show apply output
+  ansible.builtin.debug:
+    var: tf_apply.stdout_lines
+  when: tf_apply is not skipped
+
+# -----------------------------------------------------------------------------
+# TASK 10: Capture Terraform outputs
+# Outputs include: cluster_name, cluster_endpoint, ecr_repository_url, vpc_id.
+# These are printed to the job log for reference and can be used downstream.
+# -----------------------------------------------------------------------------
+- name: Get Terraform outputs
+  ansible.builtin.command:
+    cmd:   terraform output -json
+    chdir: "{{ tf_dir }}"
+  register: tf_outputs_raw
+  changed_when: false
+  when: tf_apply is not skipped
+  environment:
+    AWS_DEFAULT_REGION: "{{ aws_region }}"
+
+- name: Show infrastructure outputs
+  ansible.builtin.debug:
+    msg: "{{ environment | upper }} outputs: {{ tf_outputs_raw.stdout | from_json }}"
+  when:
+    - tf_outputs_raw is not skipped
+    - tf_outputs_raw.stdout | default('{}') | length > 2
+
+# -----------------------------------------------------------------------------
+# TASK 11: Remove plan file
+# Plan files contain resource details that should not persist on disk.
+# Always clean up after a successful apply.
+# -----------------------------------------------------------------------------
+- name: Remove plan file after apply
+  ansible.builtin.file:
+    path:  "{{ tfplan_file }}"
+    state: absent
+  when: tf_apply is not skipped

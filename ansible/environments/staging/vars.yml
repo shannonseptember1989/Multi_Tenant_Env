@@ -1,0 +1,87 @@
+---
+# =============================================================================
+# ansible/environments/staging/vars.yml
+# =============================================================================
+# All configuration for the STAGING environment.
+# Both playbooks (playbook-eks.yml and playbook-wordpress.yml) read this file.
+# Edit values here to change what gets deployed — never edit generated files.
+# =============================================================================
+
+environment: "staging"
+aws_region:  "eu-central-1"
+
+# ── Terraform remote state ────────────────────────────────────────────────────
+# The S3 bucket and DynamoDB table must exist before the first run.
+# See setup instructions for the AWS CLI commands to create them.
+tf_state_bucket: "your-terraform-state-bucket"   # REPLACE with your bucket name
+tf_state_key:    "staging/eks/terraform.tfstate"
+tf_lock_table:   "terraform-state-lock"
+
+# ── EKS cluster ───────────────────────────────────────────────────────────────
+cluster_name: "wordpress-staging"
+k8s_version:  "1.29"    # update periodically to stay on a supported version
+
+# ── EKS node group ────────────────────────────────────────────────────────────
+# Nodes run in private subnets. Auto Scaling adjusts count within min/max.
+node_instance_type: "t3.large"
+node_count_min:     2
+node_count_desired: 2
+node_count_max:     4
+
+# ── Network ───────────────────────────────────────────────────────────────────
+vpc_cidr: "10.1.0.0/16"
+public_subnet_cidrs:    # subnets for the ALB and NAT Gateway
+  - "10.1.1.0/24"
+  - "10.1.2.0/24"
+private_subnet_cidrs:   # subnets for EKS nodes and RDS
+  - "10.1.11.0/24"
+  - "10.1.12.0/24"
+availability_zones:
+  - "eu-central-1c"
+  - "eu-central-1d"
+
+# ── ECR ───────────────────────────────────────────────────────────────────────
+# Name of the ECR repository created by Terraform.
+# All environments share the same registry — image tags differentiate releases.
+ecr_repository_name: "wordpress"
+
+# ── WordPress deployment ──────────────────────────────────────────────────────
+wp_namespace: "wordpress-staging"   # Kubernetes namespace for this environment
+wp_replicas:  2                    # number of WordPress pods
+wp_version:   "6.4"              # WordPress version baked into the image
+
+# ── WordPress site ────────────────────────────────────────────────────────────
+# Site files (themes, plugins) are managed in wordpress/site/wp-content/
+# in the repository. Any commit to that directory triggers a rebuild and deploy.
+wp_domain:        "staging.wordpress.example.com"
+wp_table_prefix:  "wp_"
+
+# ── WordPress database ────────────────────────────────────────────────────────
+# Points to an RDS instance in the private subnet.
+# The DB password comes from the WP_DB_PASSWORD GitHub Secret — not stored here.
+wp_db_host: "staging-db.example.internal"
+wp_db_name: "wordpress_staging"
+wp_db_user: "wordpress"
+
+# ── WordPress uploads storage (EBS) ──────────────────────────────────────────
+# Only wp-content/uploads/ is persisted on EBS. Themes and plugins come from
+# the Docker image and are therefore version controlled in the repository.
+wp_uploads_storage: "20Gi"
+
+# ── WordPress pod resources ───────────────────────────────────────────────────
+wp_cpu_request:    "200m"
+wp_memory_request: "512Mi"
+wp_cpu_limit:      "1000m"
+wp_memory_limit:   "1Gi"
+
+# ── HTTPS ─────────────────────────────────────────────────────────────────────
+# ACM certificate covering wp_domain. Must exist before the first deployment.
+# Create via: aws acm request-certificate --domain-name staging.wordpress.example.com
+acm_certificate_arn: "arn:aws:acm:us-east-1:123456789012:certificate/staging-cert-id"   # REPLACE with your certificate ARN
+
+# ── Resource tags ─────────────────────────────────────────────────────────────
+default_tags:
+  Environment: "staging"
+  ManagedBy:   "terraform"
+  Pipeline:    "github-actions"
+  Project:     "wordpress-eks"
