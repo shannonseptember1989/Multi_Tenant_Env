@@ -199,7 +199,7 @@ jobs:
         with:
           role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
           role-session-name: "eks-dev-${{ github.run_id }}"
-          aws-region:        ${{ vars.AWS_REGION || 'us-east-1' }}
+          aws-region:        ${{ vars.AWS_REGION || 'eu-central-1' }}
 
       # Step 3: Install Terraform so Ansible can invoke it as a shell command
       - name: "Install Terraform ${{ env.TF_VERSION }}"
@@ -253,7 +253,7 @@ jobs:
         with:
           role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
           role-session-name: "eks-staging-${{ github.run_id }}"
-          aws-region:        ${{ vars.AWS_REGION || 'us-east-1' }}
+          aws-region:        ${{ vars.AWS_REGION || 'eu-central-1' }}
 
       - name: "Install Terraform ${{ env.TF_VERSION }}"
         uses: hashicorp/setup-terraform@v3
