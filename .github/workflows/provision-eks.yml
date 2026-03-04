@@ -221,7 +221,7 @@ jobs:
       - name: "Run EKS provisioning playbook - dev"
         working-directory: ansible
         run: |
-          ansible-playbook playbook-eks.yml \
+          ansible-playbook playbook-eks.yml -i inventory/hosts.yml \
             -e "target_env=dev" \
             -e "terraform_apply=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply == 'true' && 'true' || 'false' }}"
 
@@ -270,7 +270,7 @@ jobs:
       - name: "Run EKS provisioning playbook - staging"
         working-directory: ansible
         run: |
-          ansible-playbook playbook-eks.yml \
+          ansible-playbook playbook-eks.yml -i inventory/hosts.yml \
             -e "target_env=staging" \
             -e "terraform_apply=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply == 'true' && 'true' || 'false' }}"
 
@@ -313,7 +313,7 @@ jobs:
         with:
           role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
           role-session-name: "eks-prod-${{ github.run_id }}"
-          aws-region:        ${{ vars.AWS_REGION || 'eu-central-1' }}
+          aws-region:        ${{ vars.AWS_REGION || 'us-east-1' }}
 
       - name: "Install Terraform ${{ env.TF_VERSION }}"
         uses: hashicorp/setup-terraform@v3
@@ -332,6 +332,6 @@ jobs:
         # apply=true is only honoured on a manual workflow_dispatch.
         # A PR targeting prod will always be plan-only regardless of inputs.
         run: |
-          ansible-playbook playbook-eks.yml \
+          ansible-playbook playbook-eks.yml -i inventory/hosts.yml \
             -e "target_env=prod" \
             -e "terraform_apply=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply == 'true' && 'true' || 'false' }}"
