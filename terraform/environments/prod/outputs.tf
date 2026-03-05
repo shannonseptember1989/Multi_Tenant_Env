@@ -1,0 +1,10 @@
+output "vpc_id"                { value = module.vpc.vpc_id }
+output "public_subnet_ids"     { value = module.vpc.public_subnet_ids }
+output "private_subnet_ids"    { value = module.vpc.private_subnet_ids }
+output "nat_gateway_ip"        { value = module.vpc.nat_gateway_ip }
+output "cluster_name"          { value = module.eks.cluster_name }
+output "cluster_endpoint"      { value = module.eks.cluster_endpoint }
+output "node_security_group_id" { value = module.eks.node_security_group_id }
+output "ecr_repository_url"    { value = module.eks.ecr_repository_url }
+output "pipeline_role_arn"     { value = module.iam.pipeline_role_arn }
+output "kubeconfig_command"    { value = "aws eks update-kubeconfig --name ${module.eks.cluster_name} --region ${var.aws_region}" }

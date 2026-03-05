@@ -1,0 +1,651 @@
+---
+# =============================================================================
+# .github/workflows/pipeline.yml
+# =============================================================================
+# Single workflow with five independently triggerable jobs. Every job is
+# manual-only — nothing runs automatically. Select from the GitHub Actions UI:
+#   Actions -> "Pipeline" -> Run workflow -> choose job, environment, apply
+#
+# JOBS
+#   1. bootstrap      Creates S3 state bucket + DynamoDB lock table (run once)
+#   2. provision-iam  Creates GitHub OIDC provider + pipeline IAM role
+#   3. provision-vpc  Creates VPC, subnets, NAT gateway, IGW, route tables
+#   4. provision-eks  Creates EKS cluster, node group, add-ons, ECR repository
+#   5. deploy-wp      Builds WordPress image, pushes to ECR, deploys to EKS
+#
+# FIRST-TIME RUN ORDER
+#   1. bootstrap      Creates the state backend. Uses static credentials or
+#                     an admin role — the OIDC pipeline role does not exist yet.
+#   2. provision-iam  Creates the OIDC provider and pipeline IAM role.
+#                     Copy the pipeline_role_arn output to the AWS_ROLE_ARN secret.
+#   3. provision-vpc  Creates the network layer.
+#   4. provision-eks  Creates the cluster (requires VPC to exist first).
+#   5. deploy-wp      Deploys WordPress (requires EKS to be running first).
+#
+# After the first run, each job is fully independent and can be re-run at any time.
+#
+# REQUIRED GITHUB SECRETS
+#   AWS_ROLE_ARN          IAM role ARN assumed via OIDC
+#                         (output from provision-iam — set after step 2)
+#   WP_DB_PASSWORD        MySQL password for WordPress
+#   WP_AUTH_KEY           WordPress secret keys and salts.
+#   WP_SECURE_AUTH_KEY    Generate all 8 values at:
+#   WP_LOGGED_IN_KEY      https://api.wordpress.org/secret-key/1.1/salt/
+#   WP_NONCE_KEY
+#   WP_AUTH_SALT
+#   WP_SECURE_AUTH_SALT
+#   WP_LOGGED_IN_SALT
+#   WP_NONCE_SALT
+#
+# REQUIRED GITHUB VARIABLES
+#   AWS_REGION            e.g. us-east-1 (defaults to us-east-1 if not set)
+#
+# PROD APPROVAL GATE
+#   Any job targeting prod pauses for a reviewer before the job runs.
+#   Configure reviewers: Settings -> Environments -> prod -> Required Reviewers
+# =============================================================================
+
+name: "Pipeline"
+
+on:
+  workflow_dispatch:
+    inputs:
+
+      job:
+        description: "Which job to run"
+        required: true
+        type: choice
+        options:
+          - bootstrap
+          - provision-iam
+          - provision-vpc
+          - provision-eks
+          - deploy-wp
+
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+      apply:
+        description: "Apply changes? false = plan only (safe, no changes made)"
+        required: true
+        type: boolean
+        default: false
+
+      reason:
+        description: "Reason for this run (logged in job summary for audit trail)"
+        required: false
+        type: string
+        default: "Manual trigger"
+
+# OIDC — jobs must be able to request a JWT from GitHub's token endpoint.
+# contents: read allows the checkout action to clone the repository.
+permissions:
+  id-token: write
+  contents: read
+
+# Prevent two runs for the same job + environment overlapping.
+# Terraform holds a DynamoDB lock during apply — a concurrent run would hang
+# waiting to acquire it and fail. cancel-in-progress: false means the second
+# run queues rather than being cancelled outright.
+concurrency:
+  group: "pipeline-${{ github.event.inputs.job }}-${{ github.event.inputs.environment }}"
+  cancel-in-progress: false
+
+env:
+  TF_VERSION:     "1.7.0"
+  PYTHON_VERSION: "3.11"
+
+# =============================================================================
+# JOBS
+# =============================================================================
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # AUDIT LOG
+  # Runs on every trigger before any other job.
+  # Logs who ran what, why, and when — visible in the GitHub Actions summary
+  # and in the repository's audit log.
+  # ---------------------------------------------------------------------------
+  audit-log:
+    name: "Log trigger"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Print run details"
+        run: |
+          echo "============================================"
+          echo "  Pipeline Run"
+          echo "============================================"
+          echo "  Job         : ${{ github.event.inputs.job }}"
+          echo "  Environment : ${{ github.event.inputs.environment }}"
+          echo "  Apply       : ${{ github.event.inputs.apply }}"
+          echo "  Reason      : ${{ github.event.inputs.reason }}"
+          echo "  Triggered by: ${{ github.actor }}"
+          echo "  Commit SHA  : ${{ github.sha }}"
+          echo "  Run ID      : ${{ github.run_id }}"
+          echo "  Timestamp   : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "============================================"
+
+  # ===========================================================================
+  # JOB 1 — BOOTSTRAP
+  # ===========================================================================
+  # Creates the S3 bucket and DynamoDB table used by all other jobs to store
+  # and lock Terraform remote state. Run this once only — before anything else.
+  #
+  # NOTE ON CREDENTIALS
+  # The OIDC pipeline role does not exist yet at this point (provision-iam
+  # creates it in job 2). For the bootstrap job you have two options:
+  #   a) Temporarily store static AWS credentials as GitHub Secrets
+  #      AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, then remove them after
+  #      provision-iam has run and AWS_ROLE_ARN is configured.
+  #   b) Run terraform/bootstrap manually from your local workstation instead.
+  #
+  # STATE
+  # Bootstrap uses local Terraform state (terraform/bootstrap/terraform.tfstate).
+  # Commit this file to the repository after running — it is small, changes
+  # rarely, and losing it means Terraform can no longer track these resources.
+  #
+  # AFTER RUNNING
+  # Copy both output values into ansible/environments/*/vars.yml:
+  #   tf_state_bucket: <state_bucket_name output>
+  #   tf_lock_table:   <lock_table_name output>
+  # Then commit those changes before running provision-iam.
+  # ===========================================================================
+  bootstrap:
+    name: "Bootstrap — S3 state bucket + DynamoDB lock table"
+    runs-on: ubuntu-latest
+    needs: audit-log
+    if: github.event.inputs.job == 'bootstrap'
+    # No prod environment gate — bootstrap runs once globally and has no
+    # prod-specific resources. The OIDC role also does not exist yet.
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Authenticate to AWS"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: "bootstrap-${{ github.run_id }}"
+          aws-region:        ${{ vars.AWS_REGION || 'eu-central-1' }}
+
+      - name: "Install Terraform ${{ env.TF_VERSION }}"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # Bootstrap uses local state — no -backend-config flags needed.
+      # -reconfigure ensures a clean init even if .terraform/ exists already.
+      - name: "Terraform init"
+        working-directory: terraform/bootstrap
+        run: terraform init -reconfigure
+
+      - name: "Terraform validate"
+        working-directory: terraform/bootstrap
+        run: terraform validate
+
+      - name: "Terraform plan"
+        working-directory: terraform/bootstrap
+        run: |
+          terraform plan \
+            -var="aws_region=${{ vars.AWS_REGION || 'eu-central-1' }}" \
+            -out=tfplan.out
+
+          echo "## Bootstrap Plan" >> $GITHUB_STEP_SUMMARY
+          terraform show -no-color tfplan.out >> $GITHUB_STEP_SUMMARY
+
+      - name: "Terraform apply"
+        if: github.event.inputs.apply == 'true'
+        working-directory: terraform/bootstrap
+        run: |
+          terraform apply -auto-approve tfplan.out
+
+          echo "## Bootstrap Complete" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          terraform output >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+          echo ""
+          echo "======================================================"
+          echo "  NEXT STEPS"
+          echo "======================================================"
+          echo "  1. Update ansible/environments/*/vars.yml with:"
+          echo "     tf_state_bucket: $(terraform output -raw state_bucket_name)"
+          echo "     tf_lock_table:   $(terraform output -raw lock_table_name)"
+          echo "  2. Commit terraform/bootstrap/terraform.tfstate"
+          echo "  3. Commit the updated vars.yml files"
+          echo "  4. Run provision-iam (dev) to create the pipeline role"
+          echo "======================================================"
+
+  # ===========================================================================
+  # JOB 2 — PROVISION IAM
+  # ===========================================================================
+  # Creates the GitHub OIDC identity provider and the scoped pipeline IAM role
+  # that every subsequent job uses to authenticate to AWS.
+  #
+  # WHAT THIS CREATES
+  #   GitHub OIDC Provider
+  #     Registers https://token.actions.githubusercontent.com as a trusted
+  #     identity source in the AWS account. Only one can exist per account.
+  #     The dev environment creates it (create_oidc_provider = true in
+  #     terraform/environments/dev/main.tf). Staging and prod set it to false
+  #     so Terraform does not attempt to create a duplicate.
+  #
+  #   Pipeline IAM Role
+  #     Each environment gets its own role with a trust policy scoped to
+  #     your GitHub org and repo. The role has the minimum permissions needed
+  #     to run all other pipeline jobs: VPC, EKS, ECR, IAM, S3, DynamoDB,
+  #     and CloudWatch Logs.
+  #
+  # AFTER RUNNING
+  #   Copy the pipeline_role_arn output to the AWS_ROLE_ARN GitHub Secret.
+  #   Settings -> Secrets and variables -> Actions -> AWS_ROLE_ARN
+  #   All subsequent jobs authenticate using that role via OIDC.
+  #
+  # NOTE: Run dev first. The OIDC provider is created once (dev).
+  # Staging and prod skip provider creation but each get their own IAM role.
+  # ===========================================================================
+  provision-iam:
+    name: "Provision IAM — ${{ github.event.inputs.environment }}"
+    runs-on: ubuntu-latest
+    needs: audit-log
+    if: github.event.inputs.job == 'provision-iam'
+    # Prod requires a reviewer to approve before any IAM changes are made.
+    environment: ${{ github.event.inputs.environment == 'prod' && 'prod' || '' }}
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Authenticate to AWS via OIDC"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: "iam-${{ github.event.inputs.environment }}-${{ github.run_id }}"
+          aws-region:        ${{ vars.AWS_REGION || 'eu-central-1' }}
+
+      - name: "Install Terraform ${{ env.TF_VERSION }}"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: "Install Python + Ansible"
+        run: pip install ansible boto3 botocore --quiet
+
+      # Render terraform.tfvars from vars.yml so the backend config values
+      # (bucket name, lock table, region) are available for terraform init.
+      - name: "Render terraform.tfvars"
+        working-directory: ansible
+        run: |
+          ansible-playbook playbook-eks.yml -i inventory/hosts.yml \
+            -e "target_env=${{ github.event.inputs.environment }}" \
+            -e "terraform_apply=false" \
+            --tags "render-tfvars"
+
+      # Each resource type uses a separate state key so components are fully
+      # isolated — you can destroy and re-create IAM without touching VPC/EKS.
+      - name: "Terraform init"
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: |
+          BUCKET=$(grep tf_state_bucket terraform.tfvars | cut -d'"' -f2)
+          TABLE=$(grep  tf_lock_table   terraform.tfvars | cut -d'"' -f2)
+          REGION=$(grep aws_region      terraform.tfvars | cut -d'"' -f2)
+
+          terraform init -reconfigure \
+            -backend-config="bucket=$BUCKET" \
+            -backend-config="key=${{ github.event.inputs.environment }}/iam/terraform.tfstate" \
+            -backend-config="region=$REGION" \
+            -backend-config="dynamodb_table=$TABLE" \
+            -backend-config="encrypt=true"
+
+      - name: "Terraform validate"
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: terraform validate
+
+      # -target=module.iam scopes the plan to IAM resources only.
+      # No VPC or EKS resources are touched.
+      - name: "Terraform plan — IAM module only"
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: |
+          terraform plan \
+            -var-file=terraform.tfvars \
+            -target=module.iam \
+            -out=tfplan.out
+
+          echo "## IAM Plan — ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          terraform show -no-color tfplan.out >> $GITHUB_STEP_SUMMARY
+
+      - name: "Terraform apply — IAM module only"
+        if: github.event.inputs.apply == 'true'
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: |
+          terraform apply -auto-approve tfplan.out
+
+          echo "## IAM Outputs — ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          terraform output >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+          echo ""
+          echo "======================================================"
+          echo "  NEXT STEPS"
+          echo "======================================================"
+          echo "  Set the AWS_ROLE_ARN GitHub Secret to:"
+          echo "  $(terraform output -raw pipeline_role_arn 2>/dev/null || echo 'check: terraform output pipeline_role_arn')"
+          echo ""
+          echo "  Settings -> Secrets and variables -> Actions -> AWS_ROLE_ARN"
+          echo "  Then run provision-vpc."
+          echo "======================================================"
+
+  # ===========================================================================
+  # JOB 3 — PROVISION VPC
+  # ===========================================================================
+  # Provisions the network layer for the selected environment:
+  #   VPC with DNS support and DNS hostnames enabled (required by EKS)
+  #   Public subnets  — ALB and NAT gateway (internet-facing)
+  #   Private subnets — EKS worker nodes and RDS (internal only)
+  #   Internet gateway — connects the VPC to the internet
+  #   Elastic IP + NAT gateway — outbound internet for private subnets
+  #   Route tables and associations for both subnet tiers
+  #   All required kubernetes.io subnet tags for EKS ALB controller discovery
+  #
+  # Uses -target=module.vpc so only network resources are planned/applied.
+  # IAM and EKS resources in the same environment directory are not touched.
+  #
+  # Run this before provision-eks. The EKS cluster needs the vpc_id and
+  # subnet IDs that this job stores in Terraform state.
+  # ===========================================================================
+  provision-vpc:
+    name: "Provision VPC — ${{ github.event.inputs.environment }}"
+    runs-on: ubuntu-latest
+    needs: audit-log
+    if: github.event.inputs.job == 'provision-vpc'
+    environment: ${{ github.event.inputs.environment == 'prod' && 'prod' || '' }}
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Authenticate to AWS via OIDC"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: "vpc-${{ github.event.inputs.environment }}-${{ github.run_id }}"
+          aws-region:        ${{ vars.AWS_REGION || 'eu-central-1' }}
+
+      - name: "Install Terraform ${{ env.TF_VERSION }}"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: "Install Python + Ansible"
+        run: pip install ansible boto3 botocore --quiet
+
+      - name: "Render terraform.tfvars"
+        working-directory: ansible
+        run: |
+          ansible-playbook playbook-eks.yml -i inventory/hosts.yml \
+            -e "target_env=${{ github.event.inputs.environment }}" \
+            -e "terraform_apply=false" \
+            --tags "render-tfvars"
+
+      - name: "Terraform init"
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: |
+          BUCKET=$(grep tf_state_bucket terraform.tfvars | cut -d'"' -f2)
+          TABLE=$(grep  tf_lock_table   terraform.tfvars | cut -d'"' -f2)
+          REGION=$(grep aws_region      terraform.tfvars | cut -d'"' -f2)
+
+          terraform init -reconfigure \
+            -backend-config="bucket=$BUCKET" \
+            -backend-config="key=${{ github.event.inputs.environment }}/vpc/terraform.tfstate" \
+            -backend-config="region=$REGION" \
+            -backend-config="dynamodb_table=$TABLE" \
+            -backend-config="encrypt=true"
+
+      - name: "Terraform validate"
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: terraform validate
+
+      - name: "Terraform plan — VPC module only"
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: |
+          terraform plan \
+            -var-file=terraform.tfvars \
+            -target=module.vpc \
+            -out=tfplan.out
+
+          echo "## VPC Plan — ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          terraform show -no-color tfplan.out >> $GITHUB_STEP_SUMMARY
+
+      - name: "Terraform apply — VPC module only"
+        if: github.event.inputs.apply == 'true'
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: |
+          terraform apply -auto-approve tfplan.out
+
+          echo "## VPC Outputs — ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          terraform output >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+          echo ""
+          echo "======================================================"
+          echo "  VPC provisioned. Run provision-eks next."
+          echo "  NAT Gateway public IP (whitelist in external services):"
+          echo "  $(terraform output -raw nat_gateway_ip 2>/dev/null || echo 'check: terraform output nat_gateway_ip')"
+          echo "======================================================"
+
+  # ===========================================================================
+  # JOB 4 — PROVISION EKS
+  # ===========================================================================
+  # Provisions the full EKS cluster and all supporting resources:
+  #   IAM role for the EKS control plane (AmazonEKSClusterPolicy)
+  #   IAM role for worker nodes (WorkerNode, CNI, ECR, EBS CSI policies)
+  #   Security group for the control plane (HTTPS from nodes)
+  #   Security group for worker nodes (node-to-node, control plane, ALB)
+  #   EKS cluster with CloudWatch logging enabled
+  #   Managed node group in private subnets (ON_DEMAND, AL2, 50GB disk)
+  #   Add-ons: aws-ebs-csi-driver, coredns, kube-proxy, vpc-cni
+  #   ECR repository (IMMUTABLE tags, scan on push, lifecycle policy)
+  #
+  # Requires the VPC to already exist (run provision-vpc first).
+  # The VPC outputs (vpc_id, subnet IDs) are read from Terraform state
+  # by the Ansible role during terraform init.
+  #
+  # Uses the full Ansible playbook so all variable rendering, validation,
+  # and Terraform orchestration follow the same tested code path.
+  # gather_facts: false is set in the playbook — the setup module is not
+  # available on GitHub-hosted runners.
+  # ===========================================================================
+  provision-eks:
+    name: "Provision EKS — ${{ github.event.inputs.environment }}"
+    runs-on: ubuntu-latest
+    needs: audit-log
+    if: github.event.inputs.job == 'provision-eks'
+    environment: ${{ github.event.inputs.environment == 'prod' && 'prod' || '' }}
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Authenticate to AWS via OIDC"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: "eks-${{ github.event.inputs.environment }}-${{ github.run_id }}"
+          aws-region:        ${{ vars.AWS_REGION || 'eu-central-1' }}
+
+      - name: "Install Terraform ${{ env.TF_VERSION }}"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: "Install Python + Ansible"
+        run: pip install ansible boto3 botocore kubernetes --quiet
+
+      # Runs the full provision_eks Ansible role which handles:
+      #   render tfvars -> terraform init -> validate -> plan -> apply
+      # terraform_apply=false (plan only) is safe to run at any time.
+      # terraform_apply=true applies changes — set apply=true in the UI.
+      - name: "Provision EKS via Ansible"
+        working-directory: ansible
+        env:
+          ANSIBLE_FORCE_COLOR: "1"
+        run: |
+          ansible-playbook playbook-eks.yml -i inventory/hosts.yml \
+            -e "target_env=${{ github.event.inputs.environment }}" \
+            -e "terraform_apply=${{ github.event.inputs.apply }}"
+
+      - name: "Print cluster outputs"
+        if: github.event.inputs.apply == 'true'
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: |
+          echo "## EKS Outputs — ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          terraform output 2>/dev/null || echo "(run terraform init first to view outputs)"
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+          echo ""
+          echo "======================================================"
+          echo "  EKS cluster provisioned. Configure kubectl with:"
+          CLUSTER=$(terraform output -raw cluster_name 2>/dev/null || echo "wordpress-${{ github.event.inputs.environment }}")
+          echo "  aws eks update-kubeconfig --name $CLUSTER --region ${{ vars.AWS_REGION || 'eu-central-1' }}"
+          echo "  Run deploy-wp next."
+          echo "======================================================"
+
+  # ===========================================================================
+  # JOB 5 — DEPLOY WORDPRESS
+  # ===========================================================================
+  # Builds the WordPress Docker image from wordpress/docker/Dockerfile with
+  # all themes and plugins from wordpress/site/wp-content/ baked in.
+  # Pushes the image to ECR then deploys it to the EKS cluster.
+  #
+  # Requires the EKS cluster to be running (run provision-eks first).
+  #
+  # DEPLOYMENT STEPS
+  #   1. Docker image built — wp-content/ baked in from the repository
+  #   2. Image pushed to ECR with two tags:
+  #        sha-<7-char-git-sha>   immutable, permanently traceable to commit
+  #        <env>-latest           mutable, always points to the newest build
+  #   3. kubeconfig updated for the target EKS cluster via aws eks
+  #   4. Kubernetes manifests rendered from Jinja2 templates + vars.yml:
+  #        Namespace, ConfigMap, Secret, PVC, Deployment, Service, Ingress
+  #   5. kubectl apply runs for all manifests
+  #   6. kubectl rollout status waits up to 300s — fails if pods do not start
+  #
+  # WORDPRESS SECRETS (all must be set as GitHub Secrets before running)
+  #   WP_DB_PASSWORD        MySQL database password
+  #   WP_AUTH_KEY           \
+  #   WP_SECURE_AUTH_KEY     |  WordPress security keys and salts.
+  #   WP_LOGGED_IN_KEY       |  Generate fresh values at:
+  #   WP_NONCE_KEY           |  https://api.wordpress.org/secret-key/1.1/salt/
+  #   WP_AUTH_SALT           |  Store each value as a separate GitHub Secret.
+  #   WP_SECURE_AUTH_SALT    |  Never commit these to the repository.
+  #   WP_LOGGED_IN_SALT      |
+  #   WP_NONCE_SALT         /
+  # ===========================================================================
+  deploy-wp:
+    name: "Deploy WordPress — ${{ github.event.inputs.environment }}"
+    runs-on: ubuntu-latest
+    needs: audit-log
+    if: github.event.inputs.job == 'deploy-wp'
+    environment: ${{ github.event.inputs.environment == 'prod' && 'prod' || '' }}
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Authenticate to AWS via OIDC"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: "wp-${{ github.event.inputs.environment }}-${{ github.run_id }}"
+          aws-region:        ${{ vars.AWS_REGION || 'eu-central-1' }}
+
+      - name: "Install Python + Ansible"
+        run: pip install ansible boto3 botocore kubernetes --quiet
+
+      # Short git SHA used to tag the Docker image.
+      # Stored as a step output so subsequent steps can reference it cleanly.
+      - name: "Set image tag"
+        id: tag
+        run: echo "value=sha-$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      # Authenticate Docker to ECR so it can push the built image.
+      - name: "Log in to Amazon ECR"
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Build the WordPress image and push both tags to ECR.
+      # wp-content/ is COPYed into the image from the repository so themes
+      # and plugins are baked in and never need to be synced at runtime.
+      - name: "Build and push WordPress image"
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG:    ${{ steps.tag.outputs.value }}
+          ENVIRONMENT:  ${{ github.event.inputs.environment }}
+        run: |
+          ECR_REPO=$(grep ecr_repository_name ansible/environments/$ENVIRONMENT/vars.yml \
+                     | awk '{print $2}' | tr -d '"')
+          WP_VERSION=$(grep wp_version ansible/environments/$ENVIRONMENT/vars.yml \
+                       | awk '{print $2}' | tr -d '"')
+
+          echo "Building: $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG"
+
+          docker build \
+            --build-arg WP_VERSION=$WP_VERSION \
+            --no-cache \
+            -t $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPO:$ENVIRONMENT-latest \
+            wordpress/docker/
+
+          docker push $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPO:$ENVIRONMENT-latest
+
+          echo "ECR_REGISTRY=$ECR_REGISTRY" >> $GITHUB_ENV
+          echo "ECR_REPO=$ECR_REPO"         >> $GITHUB_ENV
+
+      # Run the WordPress deployment playbook.
+      # The Ansible role renders all Kubernetes manifests from Jinja2 templates,
+      # applies them via kubectl, and waits for the rollout to complete.
+      # All WordPress secrets are injected as environment variables and picked
+      # up by lookup('env', 'VAR_NAME') calls in the Kubernetes Secret template.
+      - name: "Deploy WordPress via Ansible"
+        working-directory: ansible
+        env:
+          ANSIBLE_FORCE_COLOR: "1"
+          WP_DB_PASSWORD:        ${{ secrets.WP_DB_PASSWORD }}
+          WP_AUTH_KEY:           ${{ secrets.WP_AUTH_KEY }}
+          WP_SECURE_AUTH_KEY:    ${{ secrets.WP_SECURE_AUTH_KEY }}
+          WP_LOGGED_IN_KEY:      ${{ secrets.WP_LOGGED_IN_KEY }}
+          WP_NONCE_KEY:          ${{ secrets.WP_NONCE_KEY }}
+          WP_AUTH_SALT:          ${{ secrets.WP_AUTH_SALT }}
+          WP_SECURE_AUTH_SALT:   ${{ secrets.WP_SECURE_AUTH_SALT }}
+          WP_LOGGED_IN_SALT:     ${{ secrets.WP_LOGGED_IN_SALT }}
+          WP_NONCE_SALT:         ${{ secrets.WP_NONCE_SALT }}
+        run: |
+          ansible-playbook playbook-wordpress.yml -i inventory/hosts.yml \
+            -e "target_env=${{ github.event.inputs.environment }}" \
+            -e "ecr_registry=${{ env.ECR_REGISTRY }}" \
+            -e "ecr_repo=${{ env.ECR_REPO }}" \
+            -e "image_tag=${{ steps.tag.outputs.value }}"
+
+      - name: "Print deployment summary"
+        run: |
+          echo "## WordPress Deployment — ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field        | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment  | ${{ github.event.inputs.environment }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image tag    | ${{ steps.tag.outputs.value }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ECR repo     | ${{ env.ECR_REPO }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit SHA   | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Timestamp    | $(date -u +%Y-%m-%dT%H:%M:%SZ) |" >> $GITHUB_STEP_SUMMARY
