@@ -1,6 +1,33 @@
 data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
 
+# =============================================================================
+# DATA SOURCES — look up existing VPC and subnets by ID
+# Set these variables in terraform.tfvars or pass via -var flags:
+#   terraform plan \
+#     -var="vpc_id=vpc-xxxxxxxx" \
+#     -var="private_subnet_ids=[\"subnet-aaa\",\"subnet-bbb\"]" \
+#     -var="public_subnet_ids=[\"subnet-ccc\",\"subnet-ddd\"]"
+# =============================================================================
+
+data "aws_vpc" "existing" {
+  id = var.vpc_id
+}
+
+data "aws_subnet" "private" {
+  count = length(var.private_subnet_ids)
+  id    = var.private_subnet_ids[count.index]
+}
+
+data "aws_subnet" "public" {
+  count = length(var.public_subnet_ids)
+  id    = var.public_subnet_ids[count.index]
+}
+
+# =============================================================================
+# IAM — cluster role
+# =============================================================================
+
 resource "aws_iam_role" "eks_cluster" {
   name = "${var.environment}-eks-cluster-role"
 
@@ -21,6 +48,10 @@ resource "aws_iam_role_policy_attachment" "eks_cluster_policy" {
   role       = aws_iam_role.eks_cluster.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
 }
+
+# =============================================================================
+# IAM — node role
+# =============================================================================
 
 resource "aws_iam_role" "eks_nodes" {
   name = "${var.environment}-eks-node-role"
@@ -58,9 +89,14 @@ resource "aws_iam_role_policy_attachment" "ebs_csi" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
 }
 
+# =============================================================================
+# SECURITY GROUPS
+# Both groups are created inside the existing VPC using var.vpc_id
+# =============================================================================
+
 resource "aws_security_group" "eks_cluster" {
   name        = "${var.environment}-eks-cluster-sg"
-  description = "EKS control plane — allows inbound from worker nodes"
+  description = "EKS control plane - allows inbound from worker nodes"
   vpc_id      = var.vpc_id
 
   ingress {
@@ -83,7 +119,7 @@ resource "aws_security_group" "eks_cluster" {
 
 resource "aws_security_group" "eks_nodes" {
   name        = "${var.environment}-eks-node-sg"
-  description = "EKS worker nodes — allows pod and control plane traffic"
+  description = "EKS worker nodes - allows pod and control plane traffic"
   vpc_id      = var.vpc_id
 
   ingress {
@@ -120,16 +156,23 @@ resource "aws_security_group" "eks_nodes" {
   tags = merge(var.default_tags, { Name = "${var.environment}-eks-node-sg" })
 }
 
+# =============================================================================
+# EKS CLUSTER
+# Deployed into the existing VPC subnets passed via variables
+# =============================================================================
+
 resource "aws_eks_cluster" "main" {
   name     = var.cluster_name
   version  = var.k8s_version
   role_arn = aws_iam_role.eks_cluster.arn
 
   vpc_config {
+    # Uses the existing subnet IDs passed in via variables —
+    # no new subnets are created
     subnet_ids              = concat(var.public_subnet_ids, var.private_subnet_ids)
     security_group_ids      = [aws_security_group.eks_cluster.id]
-    endpoint_private_access = true
-    endpoint_public_access  = true
+    endpoint_private_access = var.endpoint_private_access
+    endpoint_public_access  = var.endpoint_public_access
   }
 
   enabled_cluster_log_types = ["api", "audit", "authenticator", "controllerManager", "scheduler"]
@@ -138,6 +181,11 @@ resource "aws_eks_cluster" "main" {
 
   tags = merge(var.default_tags, { Name = var.cluster_name })
 }
+
+# =============================================================================
+# EKS NODE GROUP
+# Nodes run in the existing private subnets
+# =============================================================================
 
 resource "aws_eks_node_group" "main" {
   cluster_name    = aws_eks_cluster.main.name
@@ -168,6 +216,10 @@ resource "aws_eks_node_group" "main" {
 
   tags = merge(var.default_tags, { Name = "${var.environment}-node-group" })
 }
+
+# =============================================================================
+# EKS ADD-ONS
+# =============================================================================
 
 resource "aws_eks_addon" "ebs_csi" {
   cluster_name                = aws_eks_cluster.main.name
@@ -206,44 +258,10 @@ resource "aws_eks_addon" "vpc_cni" {
   tags                        = var.default_tags
 }
 
+# =============================================================================
+# ECR REPOSITORY
+# =============================================================================
+
 resource "aws_ecr_repository" "wordpress" {
   name                 = var.ecr_repository_name
   image_tag_mutability = "IMMUTABLE"
-
-  image_scanning_configuration {
-    scan_on_push = true
-  }
-
-  tags = merge(var.default_tags, { Name = var.ecr_repository_name })
-}
-
-resource "aws_ecr_lifecycle_policy" "wordpress" {
-  repository = aws_ecr_repository.wordpress.name
-
-  policy = jsonencode({
-    rules = [
-      {
-        rulePriority = 1
-        description  = "Expire untagged images after 1 day"
-        selection = {
-          tagStatus   = "untagged"
-          countType   = "sinceImagePushed"
-          countUnit   = "days"
-          countNumber = 1
-        }
-        action = { type = "expire" }
-      },
-      {
-        rulePriority = 2
-        description  = "Keep only the 20 most recent tagged images"
-        selection = {
-          tagStatus     = "tagged"
-          tagPrefixList = ["sha-", "dev-", "staging-", "prod-"]
-          countType     = "imageCountMoreThan"
-          countNumber   = 20
-        }
-        action = { type = "expire" }
-      }
-    ]
-  })
-}
